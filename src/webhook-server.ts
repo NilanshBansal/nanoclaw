@@ -3,6 +3,7 @@
  *
  * Starts lazily on first adapter registration. Routes requests by path:
  *   /webhook/{adapterName} → chat.webhooks[adapterName](request)
+ *   /hooks/{name}          → generic named webhook endpoint
  *
  * Multiple Chat instances can register adapters — each adapter name maps
  * to its owning Chat instance.
@@ -11,7 +12,12 @@ import http from 'http';
 
 import type { Chat } from 'chat';
 
+import { getDb, hasTable } from './db/connection.js';
+import type { GenericHook } from './db/generic-hooks.js';
+import { getSession } from './db/sessions.js';
 import { log } from './log.js';
+import { resolveSession, writeSessionMessage } from './session-manager.js';
+import { wakeContainer } from './container-runner.js';
 
 const DEFAULT_PORT = 3000;
 
@@ -66,6 +72,65 @@ async function fromWebResponse(webRes: Response, nodeRes: http.ServerResponse): 
   nodeRes.end();
 }
 
+/** Handle POST /hooks/{name} — generic named webhook. */
+export async function handleGenericHook(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  hookName: string,
+): Promise<void> {
+  const db = getDb();
+  if (!hasTable(db, 'generic_hooks')) {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not found');
+    return;
+  }
+
+  const hook = db.prepare('SELECT * FROM generic_hooks WHERE name = ?').get(hookName) as GenericHook | undefined;
+  if (!hook) {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not found');
+    return;
+  }
+
+  if (hook.header_validator) {
+    const auth = (req.headers['authorization'] as string | undefined) ?? '';
+    if (auth !== `Bearer ${hook.header_validator}`) {
+      res.writeHead(401, { 'Content-Type': 'text/plain' });
+      res.end('Unauthorized');
+      return;
+    }
+  }
+
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(chunk as Buffer);
+  }
+  const rawBody = Buffer.concat(chunks).toString('utf-8');
+
+  try {
+    const { session } = resolveSession(hook.agent_group_id, hook.mg_id, null, 'shared');
+    writeSessionMessage(session.agent_group_id, session.id, {
+      id: `webhook-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      kind: 'webhook',
+      timestamp: new Date().toISOString(),
+      content: JSON.stringify({ text: rawBody }),
+      trigger: 1,
+    });
+
+    const freshSession = getSession(session.id);
+    if (freshSession) {
+      await wakeContainer(freshSession);
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  } catch (err) {
+    log.error('Generic hook enqueue error', { hook: hookName, err });
+    res.writeHead(500, { 'Content-Type': 'text/plain' });
+    res.end('Internal Server Error');
+  }
+}
+
 /**
  * Register a webhook adapter on the shared server.
  * Starts the server lazily on first call.
@@ -83,6 +148,13 @@ function ensureServer(): void {
 
   server = http.createServer(async (req, res) => {
     const url = req.url || '/';
+
+    // Route: /hooks/{name} — generic webhook
+    const hookMatch = url.match(/^\/hooks\/([^/?]+)/);
+    if (hookMatch) {
+      await handleGenericHook(req, res, hookMatch[1]);
+      return;
+    }
 
     // Route: /webhook/{adapterName}
     const match = url.match(/^\/webhook\/([^/?]+)/);
