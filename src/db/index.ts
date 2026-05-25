@@ -51,3 +51,4 @@ export {
   updateContainerConfigJson,
   deleteContainerConfig,
 } from './container-configs.js';
+export { getGenericHook, createGenericHook, deleteGenericHook, listGenericHooks } from './generic-hooks.js';
